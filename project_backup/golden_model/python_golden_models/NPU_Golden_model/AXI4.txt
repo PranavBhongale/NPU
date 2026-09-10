@@ -1,0 +1,159 @@
+Write Address Channel (AW)
+output logic [31:0] awaddr;
+
+output logic [7:0]  awlen;
+    awlen = number of data transfers in a write burst (minus 1)
+    awlen	Actual transfers
+    0	     1 transfer
+    3	     4 transfers
+    7	     8 transfers
+    15	     16 transfers
+     It tells the slave:
+    "How many data beats are coming in this burst"
+
+
+output logic [2:0]  awsize; 
+     awsize = number of bytes per data beat (as power of 2)
+     Encoding:
+     awsize	                Bytes per transfer
+     000	                    1 byte
+     001                 	    2 bytes
+     010	                    4 bytes
+     011	                    8 bytes
+     100	                    16 bytes
+
+
+output logic [1:0]  awburst;
+    awburst = how the address evolves across the burst
+    | awburst | Type  | Meaning                 |
+    | ------- | ----- | ----------------------- |
+    | 00      | FIXED | same address every time |
+    | 01      | INCR  | increment address       |
+    | 10      | WRAP  | wrap around (cache use) |
+
+
+output logic        awvalid;      
+input  logic        awready;
+     awvalid and awready — handshake
+     Transfer happens ONLY when:
+     awvalid = 1 AND awready = 1
+
+    | Signal  | Controlled by  |
+    | ------- | -------------- |
+    | awvalid | Master (DMA)   |
+    | awready | Slave (memory) |
+
+
+===========================================================================
+|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+===========================================================================
+
+Write Data Channel (W)
+Master → Slave
+output logic [63:0] wdata;
+this is data bus 
+
+output logic [7:0]  wstrb;
+     wstrb — byte enable (VERY IMPORTANT)
+     wstrb tells which bytes of wdata are valid
+    | wstrb    | Meaning                  |
+    | -------- | ------------------------ |
+    | 11111111 | write all 8 bytes        |
+    | 00001111 | write lower 4 bytes only |
+    | 11110000 | write upper 4 bytes      |
+
+output logic        wlast;
+     Indicates the FINAL data beat in the burst
+     awlen = 3  → 4 transfers
+
+     Then:
+            Beat	wlast
+            1	      0
+            2	      0
+            3	      0
+            4	      1 
+
+
+output logic        wvalid;
+input  logic        wready;     this is valid ready handshake 
+     
+
+==========================================================================================
+||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+==========================================================================================
+
+
+Write Response Channel (B)
+input  logic [1:0] bresp;
+        Tells whether write succeeded or failed
+        | bresp | Meaning                                 |
+        | ----- | ----------------------------------------|
+        | 00    | OKAY                                    |
+        | 01    | EXOKAY (rare, exclusive access)         |
+        | 10    | SLVERR  (slave error)                   |
+        | 11    | DECERR  (decode error, invalid address) |
+
+
+input  logic       bvalid;
+output logic       bready;  VALID READY PROTOCALL
+
+
+
+=============================================================
+|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+=============================================================
+
+
+
+Read Address Channel (AR)
+output logic [31:0] araddr;
+     this is address 
+
+
+
+output logic [7:0]  arlen;
+    Number of data beats = arlen + 1
+    arlen = 3 → 4 transfers
+
+
+output logic [2:0]  arsize;
+     Bytes per transfer = 2^arsize
+output logic [1:0]  arburst;
+
+     Types:
+    | Value | Type  | Meaning             |
+    | ----- | ----- | ------------------- |
+    | 00    | FIXED | same address        |
+    | 01    | INCR  | increment address   |
+    | 10    | WRAP  | wrap around         |
+
+
+output logic        arvalid;    valid ready handshake
+input  logic        arready;
+
+=====================================================================
+|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
+=====================================================================
+
+Read Data Channel (R)
+
+input  logic [63:0] rdata;
+   data from slave
+
+input  logic [1:0]  rresp;
+    | rresp | Meaning  |
+    | ----- | -------- |
+    | 00    | OKAY     |
+    | 01    | EXOKAY   |
+    | 10    | SLVERR   |
+    | 11    | DECERR   |
+    
+
+input  logic        rlast;
+       Indicates the FINAL data beat of the read burst
+       high when at last beat 
+
+
+input  logic        rvalid;  valid ready handshake PROTOCALL
+output logic        rready;
+

@@ -1,0 +1,450 @@
+// =============================================================
+//  AXI4-Lite Slave — 4 x 32-bit memory-mapped registers
+//  Channels : AW / W / B  (write path)
+//             AR / R      (read path)
+//  Handshake: VALID/READY on every channel
+// =============================================================
+
+module axi4l_slave #(
+  parameter int ADDR_WIDTH = 32,
+  parameter int DATA_WIDTH = 32,   // AXI4-Lite: 32-bit only
+  parameter int NUM_REGS   = 4
+)(
+  // ── Global ────────────────────────────────────────────────
+  input  logic                  aclk,
+  input  logic                  aresetn,   // active-low reset
+
+  // ── Write Address Channel (AW) ────────────────────────────
+  input  logic [ADDR_WIDTH-1:0] awaddr,
+  input  logic [2:0]            awprot,    // ignored by slave
+  input  logic                  awvalid,
+  output logic                  awready,
+
+  // ── Write Data Channel (W) ────────────────────────────────
+  input  logic [DATA_WIDTH-1:0] wdata,
+  input  logic [3:0]            wstrb,     // byte-enable strobes
+  input  logic                  wvalid,
+  output logic                  wready,
+
+  // ── Write Response Channel (B) ────────────────────────────
+  output logic [1:0]            bresp,
+  output logic                  bvalid,
+  input  logic                  bready,
+
+  // ── Read Address Channel (AR) ─────────────────────────────
+  input  logic [ADDR_WIDTH-1:0] araddr,
+  input  logic [2:0]            arprot,    // ignored by slave
+  input  logic                  arvalid,
+  output logic                  arready,
+
+  // ── Read Data Channel (R) ─────────────────────────────
+  output logic [DATA_WIDTH-1:0] rdata,
+  output logic [1:0]            rresp,
+  output logic                  rvalid,
+  input  logic                  rready
+);
+
+  // ==========================================================
+  //  RESP codes
+  // ==========================================================
+  localparam logic [1:0] RESP_OKAY   = 2'b00;
+  localparam logic [1:0] RESP_SLVERR = 2'b10;
+
+  // ==========================================================
+  //  Register file  (4 x 32-bit, word-addressed)
+  //  Offset 0x00 → reg[0], 0x04 → reg[1], ...
+  // ==========================================================
+  logic [DATA_WIDTH-1:0] reg_file [0:NUM_REGS-1];
+
+  // ==========================================================
+  //  Internal signals
+  // ==========================================================
+  logic                  aw_handshake;   // AW channel handshake done
+  logic                  w_handshake;    // W  channel handshake done
+  logic [ADDR_WIDTH-1:0] aw_addr_lat;    // latched write address
+  logic                  aw_addr_valid;  // latched address is waiting
+
+  // ==========================================================
+  //  WRITE PATH
+  // ==========================================================
+
+  // -- AW channel --
+  // Accept address immediately when presented; latch it so
+  // the W channel can arrive independently.
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      awready      <= 1'b0;
+      aw_addr_lat  <= '0;
+      aw_addr_valid<= 1'b0;
+    end else begin
+      if (awvalid && awready) begin
+        // handshake complete: capture address, lower ready
+        aw_addr_lat   <= awaddr;
+        aw_addr_valid <= 1'b1;
+        awready       <= 1'b0;
+      end else if (aw_addr_valid && w_handshake) begin
+        // write data consumed the latched address
+        aw_addr_valid <= 1'b0;
+        awready       <= 1'b1;   // ready for next transaction
+      end else if (!aw_addr_valid) begin
+        awready <= 1'b1;         // no pending address — accept
+      end
+    end
+  end
+
+  assign aw_handshake = awvalid & awready;
+
+  // -- W channel --
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      wready <= 1'b0;
+    end else begin
+      if (wvalid && wready) begin
+        wready <= 1'b0;          // consumed, lower ready
+      end else if (!bvalid) begin
+        wready <= 1'b1;          // ready once B channel is free
+      end
+    end
+  end
+
+  assign w_handshake = wvalid & wready;
+
+  // -- Register write with byte strobes --
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      for (int i = 0; i < NUM_REGS; i++) reg_file[i] <= '0;
+    end else if (w_handshake && aw_addr_valid) begin
+      // word index from byte address (2 LSBs ignored)
+      automatic int idx = int'(aw_addr_lat[ADDR_WIDTH-1:2]) % NUM_REGS;
+      for (int b = 0; b < DATA_WIDTH/8; b++) begin
+        if (wstrb[b])
+          reg_file[idx][b*8 +: 8] <= wdata[b*8 +: 8];
+      end
+    end
+  end
+
+  // -- B channel --
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      bvalid <= 1'b0;
+      bresp  <= RESP_OKAY;
+    end else begin
+      if (w_handshake && aw_addr_valid) begin
+        bvalid <= 1'b1;
+        bresp  <= RESP_OKAY;
+      end else if (bvalid && bready) begin
+        bvalid <= 1'b0;          // handshake complete
+      end
+    end
+  end
+
+  // ==========================================================
+  //  READ PATH
+  // ==========================================================
+
+  // -- AR channel --
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      arready <= 1'b0;
+    end else begin
+      if (arvalid && !arready) begin
+        arready <= 1'b1;         // accept the address
+      end else begin
+        arready <= 1'b0;         // single-cycle pulse
+      end
+    end
+  end
+
+  // -- R channel --
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      rvalid <= 1'b0;
+      rdata  <= '0;
+      rresp  <= RESP_OKAY;
+    end else begin
+      if (arvalid && arready) begin
+        // AR handshake: present data one cycle later
+        automatic int idx = int'(araddr[ADDR_WIDTH-1:2]) % NUM_REGS;
+        rdata  <= reg_file[idx];
+        rresp  <= RESP_OKAY;
+        rvalid <= 1'b1;
+      end else if (rvalid && rready) begin
+        rvalid <= 1'b0;          // R handshake complete
+      end
+    end
+  end
+
+endmodule
+
+
+// =============================================================
+//  AXI4-Lite Master — single read / write transaction engine
+//  Issues one write then one read, asserts done when complete.
+// =============================================================
+
+module axi4l_master (
+  // ── Global ────────────────────────────────────────────────
+  input  logic        aclk,
+  input  logic        aresetn,
+
+  // ── User control ──────────────────────────────────────────
+  input  logic        start,         // pulse to begin
+  input  logic        wr_rd_n,       // 1 = write, 0 = read
+  input  logic [31:0] addr_in,
+  input  logic [31:0] wdata_in,
+  input  logic [3:0]  wstrb_in,
+  output logic [31:0] rdata_out,
+  output logic [1:0]  resp_out,
+  output logic        done,          // single-cycle pulse
+
+  // ── AXI4-Lite Master Ports ────────────────────────────────
+  output logic [31:0] awaddr,
+  output logic [2:0]  awprot,
+  output logic        awvalid,
+  input  logic        awready,
+
+  output logic [31:0] wdata,
+  output logic [3:0]  wstrb,
+  output logic        wvalid,
+  input  logic        wready,
+
+  input  logic [1:0]  bresp,
+  input  logic        bvalid,
+  output logic        bready,
+
+  output logic [31:0] araddr,
+  output logic [2:0]  arprot,
+  output logic        arvalid,
+  input  logic        arready,
+
+  input  logic [31:0] rdata,
+  input  logic [1:0]  rresp,
+  input  logic        rvalid,
+  output logic        rready
+);
+
+  // ==========================================================
+  //  FSM states
+  // ==========================================================
+  typedef enum logic [2:0] {
+    IDLE      = 3'd0,
+    WR_ADDR   = 3'd1,   // assert AW
+    WR_DATA   = 3'd2,   // assert W
+    WR_RESP   = 3'd3,   // wait B
+    RD_ADDR   = 3'd4,   // assert AR
+    RD_DATA   = 3'd5,   // wait R
+    DONE      = 3'd6
+  } state_t;
+
+  state_t state, next;
+
+  // ==========================================================
+  //  State register
+  // ==========================================================
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) state <= IDLE;
+    else          state <= next;
+  end
+
+  // ==========================================================
+  //  Next-state logic
+  // ==========================================================
+  always_comb begin
+    next = state;
+    unique case (state)
+      IDLE    : if (start)               next = wr_rd_n ? WR_ADDR : RD_ADDR;
+      WR_ADDR : if (awvalid && awready)  next = WR_DATA;
+      WR_DATA : if (wvalid  && wready)   next = WR_RESP;
+      WR_RESP : if (bvalid  && bready)   next = DONE;
+      RD_ADDR : if (arvalid && arready)  next = RD_DATA;
+      RD_DATA : if (rvalid  && rready)   next = DONE;
+      DONE    :                          next = IDLE;
+      default :                          next = IDLE;
+    endcase
+  end
+
+  // ==========================================================
+  //  Output logic
+  // ==========================================================
+
+  // fixed protection: Normal / Secure / Data
+  assign awprot = 3'b000;
+  assign arprot = 3'b000;
+
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      awaddr  <= '0; awvalid <= 1'b0;
+      wdata   <= '0; wstrb   <= 4'hF; wvalid  <= 1'b0;
+      bready  <= 1'b0;
+      araddr  <= '0; arvalid <= 1'b0;
+      rready  <= 1'b0;
+      rdata_out <= '0; resp_out <= 2'b00;
+      done    <= 1'b0;
+    end else begin
+      done <= 1'b0;   // default: deassert
+
+      unique case (state)
+        // ---- idle ----
+        IDLE: begin
+          awvalid <= 1'b0; wvalid <= 1'b0;
+          arvalid <= 1'b0; bready <= 1'b0; rready <= 1'b0;
+          if (start) begin
+            awaddr <= addr_in;
+            araddr <= addr_in;
+            wdata  <= wdata_in;
+            wstrb  <= wstrb_in;
+          end
+        end
+
+        // ---- write address ----
+        WR_ADDR: begin
+          awvalid <= 1'b1;
+          if (awvalid && awready)
+            awvalid <= 1'b0;
+        end
+
+        // ---- write data (can overlap with WR_ADDR) ----
+        WR_DATA: begin
+          wvalid <= 1'b1;
+          if (wvalid && wready)
+            wvalid <= 1'b0;
+        end
+
+        // ---- wait write response ----
+        WR_RESP: begin
+          bready <= 1'b1;
+          if (bvalid && bready) begin
+            resp_out <= bresp;
+            bready   <= 1'b0;
+          end
+        end
+
+        // ---- read address ----
+        RD_ADDR: begin
+          arvalid <= 1'b1;
+          if (arvalid && arready)
+            arvalid <= 1'b0;
+        end
+
+        // ---- wait read data ----
+        RD_DATA: begin
+          rready <= 1'b1;
+          if (rvalid && rready) begin
+            rdata_out <= rdata;
+            resp_out  <= rresp;
+            rready    <= 1'b0;
+          end
+        end
+
+        // ---- done pulse ----
+        DONE: done <= 1'b1;
+
+        default: ;
+      endcase
+    end
+  end
+
+endmodule
+
+
+// =============================================================
+//  Top-level testbench — connects master to slave
+// =============================================================
+
+module tb_axi4l;
+
+  logic        clk, rstn;
+
+  // master → slave
+  logic [31:0] awaddr; logic [2:0] awprot; logic awvalid, awready;
+  logic [31:0] wdata;  logic [3:0] wstrb;  logic wvalid,  wready;
+  logic [1:0]  bresp;  logic bvalid, bready;
+  logic [31:0] araddr; logic [2:0] arprot; logic arvalid, arready;
+  logic [31:0] rdata;  logic [1:0] rresp;  logic rvalid,  rready;
+
+  // master control
+  logic        start, wr_rd_n, done;
+  logic [31:0] addr_in, wdata_in, rdata_out;
+  logic [3:0]  wstrb_in;
+  logic [1:0]  resp_out;
+
+  // ── DUT instances ─────────────────────────────────────────
+  axi4l_master u_master (
+    .aclk(clk), .aresetn(rstn),
+    .start(start), .wr_rd_n(wr_rd_n),
+    .addr_in(addr_in), .wdata_in(wdata_in), .wstrb_in(wstrb_in),
+    .rdata_out(rdata_out), .resp_out(resp_out), .done(done),
+    .awaddr(awaddr), .awprot(awprot), .awvalid(awvalid), .awready(awready),
+    .wdata(wdata),   .wstrb(wstrb),   .wvalid(wvalid),   .wready(wready),
+    .bresp(bresp),   .bvalid(bvalid), .bready(bready),
+    .araddr(araddr), .arprot(arprot), .arvalid(arvalid), .arready(arready),
+    .rdata(rdata),   .rresp(rresp),   .rvalid(rvalid),   .rready(rready)
+  );
+
+  axi4l_slave u_slave (
+    .aclk(clk), .aresetn(rstn),
+    .awaddr(awaddr), .awprot(awprot), .awvalid(awvalid), .awready(awready),
+    .wdata(wdata),   .wstrb(wstrb),   .wvalid(wvalid),   .wready(wready),
+    .bresp(bresp),   .bvalid(bvalid), .bready(bready),
+    .araddr(araddr), .arprot(arprot), .arvalid(arvalid), .arready(arready),
+    .rdata(rdata),   .rresp(rresp),   .rvalid(rvalid),   .rready(rready)
+  );
+
+  // ── Clock: 10 ns period ───────────────────────────────────
+  initial clk = 0;
+  always #5 clk = ~clk;
+
+  // ── Helper task: single write ─────────────────────────────
+  task automatic do_write(input logic [31:0] a, d, input logic [3:0] s);
+    addr_in  = a; wdata_in = d; wstrb_in = s; wr_rd_n = 1'b1;
+    @(posedge clk); #1; start = 1'b1;
+    @(posedge clk); #1; start = 1'b0;
+    wait(done); @(posedge clk);
+    $display("[%0t] WRITE  addr=0x%08h data=0x%08h resp=%02b",
+             $time, a, d, resp_out);
+  endtask
+
+  // ── Helper task: single read ──────────────────────────────
+  task automatic do_read(input logic [31:0] a);
+    addr_in = a; wr_rd_n = 1'b0;
+    @(posedge clk); #1; start = 1'b1;
+    @(posedge clk); #1; start = 1'b0;
+    wait(done); @(posedge clk);
+    $display("[%0t] READ   addr=0x%08h data=0x%08h resp=%02b",
+             $time, a, rdata_out, resp_out);
+  endtask
+
+  // ── Stimulus ──────────────────────────────────────────────
+  initial begin
+    // initialise
+    rstn = 1'b0; start = 1'b0; wr_rd_n = 1'b0;
+    addr_in = '0; wdata_in = '0; wstrb_in = 4'hF;
+    repeat(4) @(posedge clk);
+    rstn = 1'b1;
+    repeat(2) @(posedge clk);
+
+    // write reg[0] = 0xDEAD_BEEF
+    do_write(32'h0000_0000, 32'hDEAD_BEEF, 4'hF);
+    // write reg[1] = 0xCAFE_BABE
+    do_write(32'h0000_0004, 32'hCAFE_BABE, 4'hF);
+    // write reg[2] lower half only (wstrb = 0011)
+    do_write(32'h0000_0008, 32'h0000_1234, 4'b0011);
+
+    // read them back
+    do_read(32'h0000_0000);
+    do_read(32'h0000_0004);
+    do_read(32'h0000_0008);
+
+    repeat(4) @(posedge clk);
+    $display("[%0t] Simulation complete.", $time);
+    $finish;
+  end
+
+  // ── Waveform dump ─────────────────────────────────────────
+  initial begin
+    $dumpfile("axi4l_tb.vcd");
+    $dumpvars(0, tb_axi4l);
+  end
+
+endmodule
+
